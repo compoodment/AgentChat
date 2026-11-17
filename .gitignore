@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Runtime state and local configuration must not enter source control.
+data/
+*.jsonl
+.env
+.env.*
+*.log
