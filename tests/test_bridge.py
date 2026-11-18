@@ -54,6 +54,48 @@ class BridgeTests(unittest.TestCase):
         store.set_ack('codex',message['id']);self.controller.tick()
         self.assertIsNone(bridge._state()['pending']);self.assertEqual(len(self.calls),1)
 
+    def test_ack_during_native_status_does_not_queue_an_already_handled_message(self):
+        message = self.user()
+
+        def finish_turn():
+            store.set_ack('codex', message['id'])
+            return 'idle'
+
+        self.native.status.side_effect = finish_turn
+        self.controller.tick()
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(bridge._state()['pending'])
+        self.assertEqual(store.get_ack('codex'), message['id'])
+
+    def test_disable_during_native_status_does_not_queue(self):
+        self.user()
+
+        def disable():
+            bridge._update(enabled=False)
+            return 'idle'
+
+        self.native.status.side_effect = disable
+        self.assertIsNone(self.controller.tick())
+        self.assertEqual(self.calls, [])
+        self.assertIsNone(bridge._state()['pending'])
+
+    def test_pause_during_native_status_preserves_the_unread_wake(self):
+        message = self.user()
+
+        def pause():
+            store.set_policy('paused')
+            return 'idle'
+
+        self.native.status.side_effect = pause
+        self.controller.tick()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(store.get_ack('codex'), 0)
+        self.native.status.side_effect = None
+        store.resume_policy()
+        self.controller.tick()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0][1]['through'], message['id'])
+
     def test_restart_and_failure_retry_keep_wake_id_and_unread_position(self):
         self.user();self.controller.enqueue=mock.Mock(side_effect=OSError('queue unavailable'))
         self.controller.tick();first=bridge._state()['pending']
@@ -136,10 +178,20 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(store.get_ack('codex'),0)
         self.assertEqual([m['id'] for m in store.read_messages() if m['kind']=='msg'],[first['id'],newer['id']])
 
+    def test_code_and_quoted_mentions_do_not_wake_but_real_mentions_do(self):
+        store.set_policy("custom", limit=100, window_s=60, duration_s=3600)
+        for text in ('`@codex` is an example', '> @all quoted', '```\n@codex\n```'):
+            store.append_message('claude', text)
+            self.controller.tick()
+        self.assertEqual(self.calls, [])
+        store.append_message('claude', '@codex please review')
+        self.controller.tick()
+        self.assertEqual(len(self.calls), 1)
+
     def test_peer_updates_only_wake_on_target_mentions_or_replies_to_codex(self):
         store.set_policy('custom',limit=100,window_s=60,duration_s=3600)
         own=store.append_message('codex','request to peer')
-        for text in ('FYI for user','name@agent.invalid','@codex-old'):
+        for text in ('FYI for user','me@codex.com','@codex-old'):
             store.append_message('claude',text)
         self.controller.tick();self.assertEqual(self.calls,[])
         directed=store.append_message('claude',f"↪ #{own['id']} done")

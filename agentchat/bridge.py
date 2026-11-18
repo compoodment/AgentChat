@@ -1,4 +1,4 @@
-"""Event-driven waking of one existing Codex session using the standard library."""
+"""Event-driven waking of one existing Codex session. Standard library only."""
 import json
 import math
 import os
@@ -18,7 +18,6 @@ MAX_ATTEMPTS = 3
 # Merely closing an O_RDWR flock handle emits CLOSE_WRITE even without a write.
 # Watch real modifications/renames, excluding CLOSE_WRITE to avoid waking ourselves.
 WATCH_MASK = 0x00000FC6
-MENTION = re.compile(r'(?<![\w.])@(codex|all)(?![\w-])', re.I)
 REPLY = re.compile(r'^↪ #([0-9]{1,12})(?![0-9])\s+')
 
 
@@ -116,7 +115,7 @@ def queue_codex(thread, pending):
 def relevant(message):
     if message['kind'] != 'msg' or message['sender'] == 'codex':
         return False
-    if message['sender'] == store.USER or MENTION.search(message['text']):
+    if message['sender'] == store.USER or 'codex' in store.mentioned_agents(message['text']):
         return True
     reply = REPLY.match(message['text'])
     if reply and int(reply.group(1)) > 0:
@@ -158,7 +157,7 @@ class Controller:
                 native = self.session.status()  # metadata health check, never a model request
                 label = 'working' if native == 'active' else 'listening'
                 _update(status=label)
-                self._presence(label, 'Same-session watcher ready', now)
+                self._presence(label, '', now)
             self.session.close()  # no unattended WebSocket ping/timeout while the chat is silent
             return 30
         if pending and pending['phase'] == 'failed':
@@ -168,8 +167,18 @@ class Controller:
         native = self.session.status()
         if native == 'active':
             _update(status='working')
-            self._presence('working', 'Existing Codex turn is active', now)
+            self._presence('working', '', now)
             return 1
+        # The session can acknowledge work or the user can pause/stop the
+        # watcher while the native status request is in flight.
+        current = _state()
+        if not current['enabled']:
+            self.session.close()
+            return None
+        if (current['pending'] != pending or current.get('probe_requested') != state.get('probe_requested')
+                or store.get_ack('codex') != ack or store.guard_status()['blocked']):
+            self.session.close()
+            return 0
         if pending is None:
             probe = state.get('probe_requested')
             pending = dict(id=probe or uuid.uuid4().hex, kind='probe' if probe else 'messages',

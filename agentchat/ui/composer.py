@@ -7,12 +7,13 @@ import re
 import select
 import sys
 import time
+import unicodedata
 from datetime import datetime
 
 from agentchat import store
 from agentchat.ui import keys as modified
 from agentchat.ui.shiftkey import shift_held
-from agentchat.ui.text import REPLY, cell_width, clean, duration, fit, parse_duration
+from agentchat.ui.text import REPLY, cell_width, clean, duration, fit, parse_duration, text_width
 
 
 QUIT_WINDOW = 2             # seconds for the second Ctrl+C
@@ -34,34 +35,58 @@ COMMANDS = ("/claim", "/custom", "/export", "/release", "/claims", "/find", "/mo
 PASTE_START, PASTE_END = "[200~", "[201~"
 REPLY_DRAFT = re.compile(r"/reply(?:\s+#?(\d+))?\s*")   # what Tab fills in /reply's number for
 CHIP_CHARS, CHIP_LINES = 1000, 12    # larger pastes show as a chip and expand on send
+CHIP_FIRST = 0xF0000                 # a chip is one private-use character in the draft, drawn as its label: typed
+                                     # text that looks like a label stays text, and the cursor can't split a chip
+
+
+def is_chip(ch):
+    return len(ch) == 1 and CHIP_FIRST <= ord(ch) <= 0xFFFFD
+LIST_ITEM = re.compile(r"([ \t]*)(?:(\d{1,9})([.)])(?:[ \t]+|(?=\n|\Z))|([-*\u2022])[ \t]+)")   # "4. ", "4.", "4) ", "- "
+HISTORY_KEYS = {curses.KEY_SR: -1, curses.KEY_SF: 1,    # Shift+Up/Down as terminfo names them
+                b"kUP": -1, b"kDN": 1, b"kUP3": -1, b"kDN3": 1, b"kUP5": -1, b"kDN5": 1}   # and Shift/Alt/Ctrl, extended
 
 
 class Composer:
     """The draft: keys, bracketed paste, chips, history, completion and sending. Mixed into Screen."""
 
     def composer_lines(self, width):
-        """Visual rows of the draft and the cursor's (row, col)."""
+        """Visual rows of the draft, chips drawn as their labels, and the cursor's (row, col)."""
+        rows, _starts, cursor = self._composer_layout(width)
+        if self.chips:
+            rows = ["".join(fit(self.chip_label(ch), width - 2) if ch in self.chips else ch for ch in row)
+                    for row in rows]
+        return rows, cursor
+
+    def _cells(self, ch, width):
+        """A draft character's width on screen: a chip is as wide as its label (at most a row)."""
+        return min(text_width(self.chip_label(ch)), width - 2) if ch in self.chips else cell_width(ch)
+
+    def _composer_layout(self, width):
+        """Visual rows, the draft offset each row starts at, and the cursor's (row, col)."""
         room = width - 2
-        rows, cursor = [], None
+        rows, starts, cursor = [], [], None
         position = 0
         for line in self.draft.split("\n"):
             chunk, used, start = "", 0, position
+            row_start = position
             for offset, ch in enumerate(line + "\0"):
                 if offset == len(line):
                     if position + offset == self.cursor and cursor is None:
                         cursor = (len(rows), used)
                     break
-                size = cell_width(ch)
+                size = self._cells(ch, width)
                 if used + size > room:
                     rows.append(chunk)
-                    chunk, used = "", 0
+                    starts.append(row_start)
+                    chunk, used, row_start = "", 0, position + offset
                 if position + offset == self.cursor and cursor is None:
                     cursor = (len(rows), used)
                 chunk += ch
                 used += size
             rows.append(chunk)
+            starts.append(row_start)
             position = start + len(line) + 1
-        return rows, cursor or (len(rows) - 1, 0)
+        return rows, starts, cursor or (len(rows) - 1, 0)
 
 
     # -- input ------------------------------------------------------------
@@ -137,7 +162,7 @@ class Composer:
                         continue
                     self.interacted = True
                     if decoded[0] == "newline":         # Shift/Alt/Ctrl+Enter from a terminal that tells them apart
-                        self.insert("\n")
+                        self.newline()
                     elif decoded[0] == "escape":
                         self.escape()
                     elif decoded[0] == "alt":
@@ -160,7 +185,7 @@ class Composer:
         return True
 
     def alt_keys(self):
-        newline = lambda: self.insert("\n")
+        newline = self.newline
         return {"\r": newline, "\n": newline, curses.KEY_ENTER: newline, "b": self.word_left,
                 "f": self.word_right, "\x7f": self.delete_word, curses.KEY_BACKSPACE: self.delete_word}
 
@@ -178,10 +203,12 @@ class Composer:
 
     def wheel(self):
         try:
-            _, _, _, _, buttons = curses.getmouse()
+            _, x, y, _, buttons = curses.getmouse()
         except curses.error:
             return
-        if buttons & curses.BUTTON4_PRESSED:
+        if buttons & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+            self.clicked(y, x)
+        elif buttons & curses.BUTTON4_PRESSED:
             self.scroll += WHEEL_ROWS
         elif buttons & curses.BUTTON5_PRESSED:
             self.scroll = max(0, self.scroll - WHEEL_ROWS)
@@ -191,7 +218,8 @@ class Composer:
     def set_mouse(self, on):
         """Wheel events scroll the chat; while on, selecting text with the mouse needs Shift+drag."""
         self.mouse = on
-        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED if on else 0)
+        clicks = curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED   # '#N' starts a reply; '↪ #N' jumps there
+        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED | clicks if on else 0)
 
     def focus(self, gained):
         """The terminal window gained or lost focus. Gaining it counts as the user looking."""
@@ -205,30 +233,36 @@ class Composer:
         if self.busy():                     # before any chip bookkeeping
             return
         lines = text.count("\n") + 1
-        if len(text) <= CHIP_CHARS and lines <= CHIP_LINES:
-            self.insert(text)
+        if len(text) <= CHIP_CHARS and lines <= CHIP_LINES:   # drawn as typed: tabs as spaces, no control codes
+            self.insert("".join(ch for ch in text.replace("\t", "    ")
+                                if ch == "\n" or unicodedata.category(ch) != "Cc"))
             return
         self.chip_count += 1
-        label = f"[Pasted text #{self.chip_count} · {lines} lines]" if lines > 1 else \
-                f"[Pasted text #{self.chip_count} · {len(text)} chars]"
-        self.chips[label] = text
-        self.insert(label)
+        chip = self._fresh_chip()
+        self.chips[chip], self.chip_numbers[chip] = text, self.chip_count
+        at = self.snap(self.cursor)             # not insert(): that would treat the chip's own key as text
+        self.draft, self.cursor = self.draft[:at] + chip + self.draft[at:], at + 1
+        self.menu_index, self.menu_closed, self.history_pos = 0, False, None
+
+    def _fresh_chip(self, avoid=""):
+        """A private-use character not already in the draft (or `avoid`): chips never collide with text."""
+        code = CHIP_FIRST + self.chip_count     # usually the chip's own number, so its label matches after restore
+        while chr(code) in self.draft or chr(code) in avoid or chr(code) in self.chips:
+            code += 1
+        return chr(code)
+
+    def chip_label(self, chip):
+        text = self.chips[chip]
+        lines = text.count("\n") + 1
+        number = self.chip_numbers.get(chip, ord(chip) - CHIP_FIRST)
+        return f"[Pasted text #{number} · {lines} lines]" if lines > 1 else f"[Pasted text #{number} · {len(text)} chars]"
 
     def expand(self, text):
-        """Replace chip labels with their pasted text in one pass, so pasted text is never re-expanded."""
-        if not self.chips:
-            return text
-        pattern = "|".join(re.escape(label) for label in sorted(self.chips, key=len, reverse=True))
-        return re.sub(pattern, lambda match: self.chips[match.group(0)], text)
+        """Chips back to their pasted text; nothing else in the draft can be mistaken for one."""
+        return "".join(self.chips.get(ch, ch) for ch in text) if self.chips else text
 
     def chip_spans(self):
-        spans = []
-        for label in self.chips:
-            start = self.draft.find(label)
-            while start >= 0:
-                spans.append((start, start + len(label)))
-                start = self.draft.find(label, start + 1)
-        return spans
+        return [(index, index + 1) for index, ch in enumerate(self.draft) if ch in self.chips]
 
     def snap(self, position, forward=True):
         """Move a position out of the inside of a chip, so chips edit as one unit."""
@@ -239,6 +273,7 @@ class Composer:
 
     def cut(self, start, end):
         """Delete draft[start:end], widened to whole chips; forget chips no longer in the draft."""
+        self.history_pos = None             # an edited recalled entry is the draft now: Up mustn't discard it
         if self.busy():
             return
         for chip_start, chip_end in self.chip_spans():
@@ -246,7 +281,7 @@ class Composer:
                 start, end = min(start, chip_start), max(end, chip_end)
         self.draft = self.draft[:start] + self.draft[end:]
         self.cursor = start
-        self.chips = {label: text for label, text in self.chips.items() if label in self.draft}
+        self.chips = {chip: text for chip, text in self.chips.items() if chip in self.draft}
 
     def busy(self):
         """True (with a note) while a send is in flight: the draft being sent can't change underneath it."""
@@ -261,9 +296,32 @@ class Composer:
             return
         self.menu_index, self.menu_closed = 0, False
         self.cursor = self.snap(self.cursor)
+        for chip in [chip for chip in self.chips if chip in text]:   # literal text keeps its characters
+            fresh = self._fresh_chip(avoid=text)
+            self.draft = self.draft.replace(chip, fresh)
+            self.chips[fresh] = self.chips.pop(chip)
+            self.chip_numbers[fresh] = self.chip_numbers.pop(chip, ord(chip) - CHIP_FIRST)
         self.draft = self.draft[:self.cursor] + text + self.draft[self.cursor:]
         self.cursor += len(text)
         self.history_pos = None
+
+    def newline(self):
+        """A typed new line (never a paste): continues a list, so "4. x" is followed by "5. ", and an empty
+        item after other items ends the list instead. A lone "1." starts one."""
+        if self.busy():                     # a send is in flight: the draft is frozen until it lands
+            return
+        found = LIST_ITEM.match(self.draft, self._line_bounds()[0])
+        if not found or self.cursor < found.end():
+            self.insert("\n")
+            return
+        start, end = self._line_bounds()
+        above = self.draft.rfind("\n", 0, start - 1) + 1 if start else None
+        listed = above is not None and LIST_ITEM.match(self.draft[above:start - 1])
+        if self.cursor == end and not self.draft[found.end():end].strip() and listed:   # an empty item ends it
+            self.cut(found.start(), end)
+            return
+        indent, number, style, bullet = found.groups()
+        self.insert("\n" + indent + (f"{int(number) + 1}{style}" if number else bullet) + " ")
 
     def word_left(self):
         while self.cursor and self.draft[self.cursor - 1].isspace():
@@ -320,6 +378,17 @@ class Composer:
         self.cursor = len(self.draft)
         self.note(f"#{target['id']} {target['sender']}: {' '.join(REPLY.sub('', clean(target['text'])).split())}")
 
+    def start_reply(self, message_id):
+        """The reply button (a click on '#N'): '/reply N ' in front of whatever is already typed."""
+        if self.busy():
+            return
+        typed = REPLY_DRAFT.sub("", self.draft, count=1) if self.draft.startswith("/reply") else self.draft
+        self.draft = f"/reply {message_id} " + typed
+        self.cursor, self.history_pos = len(self.draft), None
+        target = self.by_id.get(message_id)
+        if target:
+            self.note(f"#{message_id} {target['sender']}: {' '.join(REPLY.sub('', clean(target['text'])).split())}")
+
     def set_highlight(self, words):
         if words != self.highlight:
             self.highlight = words
@@ -337,7 +406,8 @@ class Composer:
         elif self.scroll:
             self.scroll, self.unseen = 0, {}
         elif self.draft and now - self.esc_at < QUIT_WINDOW and not self.busy():
-            self.stash, self.draft, self.cursor = self.draft, "", 0
+            self.stash, self.stash_chips = self.draft, dict(self.chips)   # the text and its chips go together
+            self.draft, self.cursor, self.chips = "", 0, {}
             self.note("Draft cleared · ↑ brings it back")
             self.esc_at = 0
             return
@@ -350,37 +420,52 @@ class Composer:
         return start, len(self.draft) if end < 0 else end
 
     def vertical(self, step):
-        start, end = self._line_bounds()
-        column = self.cursor - start
-        if step < 0 and start > 0:
-            above = self.draft.rfind("\n", 0, start - 1) + 1
-            self.cursor = min(above + column, start - 1)
+        """Up/Down move by the rows on screen, so a long wrapped line isn't skipped; past the top or bottom row
+        they jump to the start or end of the draft. An empty draft (and entries recalled from one) walk the sent
+        history instead, so recalling stays one key; with text in the box the history is Shift+Up/Down."""
+        width = self.win.getmaxyx()[1]
+        rows, starts, (row, column) = self._composer_layout(width)
+        target = row + step
+        if not 0 <= target < len(rows):
+            if not self.draft or (self.history_pos is not None and not self.saved_draft[0]):
+                self.recall(step)           # one-key recall: from an empty box ↑↑ keeps walking back, ↓ returns
+            else:                           # a terminal can't report a held key: the edge row is the "hold"
+                self.cursor = 0 if step < 0 else len(self.draft)
             return
-        if step > 0 and end < len(self.draft):
-            below_end = self.draft.find("\n", end + 1)
-            below_end = len(self.draft) if below_end < 0 else below_end
-            self.cursor = min(end + 1 + column, below_end)
-            return
-        self.recall(step)
+        offset, used = starts[target], 0
+        for ch in rows[target]:
+            size = self._cells(ch, width)
+            if used + size > column:
+                break
+            used += size
+            offset += 1
+        wrapped = target + 1 < len(starts) and starts[target + 1] == starts[target] + len(rows[target])
+        if wrapped and offset == starts[target + 1]:
+            offset -= 1                     # the end of a wrapped row is drawn at the start of the next
+        self.cursor = self.snap(offset, forward=step > 0)
 
     def recall(self, step):
         if self.busy():
             return
         if not self.history and not self.stash:
             return
-        entries = self.history + ([self.stash] if self.stash and self.stash not in self.history[-1:] else [])
+        # each entry is text with its own chips: sent text is already expanded, a stash keeps its pastes
+        entries = [(text, {}) for text in self.history]
+        if self.stash and self.stash not in self.history[-1:]:
+            entries.append((self.stash, self.stash_chips))
         if self.history_pos is None:
             if step > 0:
                 return
-            self.saved_draft = self.draft
+            self.saved_draft = (self.draft, dict(self.chips))
             self.history_pos = len(entries)
         self.history_pos += step
         if self.history_pos >= len(entries):
             self.history_pos = None
-            self.draft = self.saved_draft
+            self.draft, chips = self.saved_draft
         else:
             self.history_pos = max(0, self.history_pos)
-            self.draft = entries[self.history_pos]
+            self.draft, chips = entries[self.history_pos]
+        self.chips = dict(chips)
         self.cursor = len(self.draft)
 
     def complete(self):
@@ -403,10 +488,12 @@ class Composer:
         if len(matches) == 1:
             self.draft = self.draft[:start] + matches[0] + " " + self.draft[self.cursor:]
             self.cursor = start + len(matches[0]) + 1
+            self.history_pos = None
         elif matches:
             common = os.path.commonprefix(matches)
             self.draft = self.draft[:start] + common + self.draft[self.cursor:]
             self.cursor = start + len(common)
+            self.history_pos = None
             self.note("  ".join(matches))
 
     def key(self, key):
@@ -420,13 +507,18 @@ class Composer:
             if name in (b"kxIN", b"kxOUT"):
                 self.focus(name == b"kxIN")     # terminfo-decoded focus report
                 return True
+            if name in HISTORY_KEYS:
+                self.interacted = True
+                self.recall(HISTORY_KEYS[name])
+                return True
             word = {b"kLFT3": self.word_left, b"kLFT5": self.word_left, b"kRIT3": self.word_right,
                     b"kRIT5": self.word_right}.get(name)
             if word:                        # Alt/Ctrl+Left/Right, as curses decodes them: a word at a time
                 self.interacted = True
                 word()
                 return True
-        self.interacted = True
+        if key != curses.KEY_RESIZE:        # a resize isn't the user reading: it mustn't move the read marker
+            self.interacted = True
         if key == curses.KEY_MOUSE:          # touchpad / wheel: scroll the transcript, not the history
             self.wheel()
             return True
@@ -456,14 +548,14 @@ class Composer:
             if self.busy():
                 return True
             if shift_held():                # Shift+Enter: a new line (the terminal sends it as plain Enter)
-                self.insert("\n")
+                self.newline()
                 return True
             text = self.draft.strip("\n").rstrip()  # keep leading spaces: pasted code stays indented
             if text.strip():
                 self.submit(text)
             return self.running
         if key == "\n":                     # Ctrl+J
-            self.insert("\n")
+            self.newline()
         elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
             if self.cursor:                 # a chip goes in one press
                 self.cut(self.cursor - 1, self.cursor)
@@ -482,6 +574,8 @@ class Composer:
             self.vertical(-1)
         elif key == curses.KEY_DOWN:
             self.vertical(1)
+        elif key in HISTORY_KEYS:           # Shift/Alt/Ctrl+Up/Down: the sent history, whatever is in the box
+            self.recall(HISTORY_KEYS[key])
         elif key == "\x15":                 # Ctrl+U: delete to line start
             self.cut(self._line_bounds()[0], self.cursor)
         elif key == "\x0b":                 # Ctrl+K: delete to line end
@@ -498,11 +592,10 @@ class Composer:
             self.scroll = max(0, self.scroll - max(1, (height - 8) // 2))
             if not self.scroll:
                 self.unseen = {}
-        elif key == "\x0c":                 # Ctrl+L
-            self.win.clear()
-        elif key == curses.KEY_RESIZE:
+        elif key == "\x0c":                 # Ctrl+L: a full repaint, inside the next frame
+            self.win.clearok(True)
+        elif key == curses.KEY_RESIZE:     # the app's resize handler already cleared: once is enough
             curses.update_lines_cols()
-            self.win.clear()
         elif isinstance(key, str) and (key.isprintable() or key == " "):
             self.insert(key)
         return True
@@ -510,7 +603,7 @@ class Composer:
     def set_mode(self, command, argument):
         """/custom N M D, /custom off, /mode normal|wait, /pause, /resume. False (with a note) if unusable."""
         if not hasattr(store, "set_policy"):
-            self.note("This version of the store does not support modes", "error")
+            self.note("Modes need the store update Codex is building", "error")
             return False
         parts = argument.split()
         if command == "/custom" and parts == ["off"] or command == "/mode" and parts == ["normal"]:
@@ -555,7 +648,7 @@ class Composer:
             else:
                 lines += [f"*#{message['id']} {name} {message['kind']}: {message['text']}* · {when}", ""]
         os.makedirs(self.EXPORTS, exist_ok=True)
-        path = os.path.join(self.EXPORTS, f"{datetime.now():%Y-%m-%d-%H%M}-chat-{messages[0]['id']}-{messages[-1]['id']}.md")
+        path = os.path.join(self.EXPORTS, f"{datetime.now():%Y-%m-%d-%H%M%S}-chat-{messages[0]['id']}-{messages[-1]['id']}.md")
         with open(path, "w", encoding="utf-8") as out:
             out.write("\n".join(lines))
         return path
@@ -590,18 +683,21 @@ class Composer:
             self.note("Usage: /find some words · /find again for older matches", "error")
             return
         needle = query.casefold()
-        for message in reversed(self.view if self.view is not None else self.messages):
+        shown = self.messages if before is None else (self.view if self.view is not None else self.messages)
+        for message in reversed(shown):     # a new search starts from the latest messages, even in history
             if before is not None and message["id"] >= before:
                 continue
             if message["kind"] == "msg" and needle in message["text"].casefold():
                 self.found = (query, message["id"])
                 self.set_highlight(query)
+                if shown is self.messages:
+                    self.view = None
                 self.jump_to(message["id"])
                 self.note(f"Found #{message['id']} · /find for older · Esc to return")
                 return
-        shown = self.view if self.view is not None else self.messages
         oldest = shown[0]["id"] if shown else None
-        hits = store.search_messages(query, limit=1, before_id=min(filter(None, (before, oldest)), default=None))
+        hits = store.search_messages(query, limit=1, before_id=min(filter(None, (before, oldest)), default=None),
+                                     kind="msg")    # only messages can be shown, not claims or notices
         older = hits[-1] if hits else None
         if older:                           # older than the screen holds: open a history view around it
             self.found = (query, older["id"])
@@ -618,7 +714,7 @@ class Composer:
         self.running = True
         command, _, argument = text.strip().partition(" ")
         if command == "/reply":             # '/reply 42 text' becomes the message '↪ #42 text'
-            target, _, rest = argument.strip().partition(" ")
+            target, rest = (argument.split(None, 1) + ["", ""])[:2]   # a new line after the number works too
             if not target.lstrip("#").isdigit() or not rest.strip():
                 self.note("Usage: /reply 42 your answer", "error")
                 return
@@ -694,7 +790,7 @@ class Composer:
         if text not in self.history[-1:] and text.startswith("/"):
             self.history.append(text)
         self.draft, self.cursor, self.history_pos, self.stash = "", 0, None, ""
-        self.chips = {}
+        self.chips, self.stash_chips = {}, {}
         self.notes = [n for n in self.notes if n[1] != "error"]
         self.save_draft(now=True)           # a crash right after sending must not restore the sent text
         if changed:

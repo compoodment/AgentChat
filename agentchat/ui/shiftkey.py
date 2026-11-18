@@ -1,9 +1,9 @@
 """Whether Shift is held right now, for Shift+Enter (a new line instead of sending).
 
-Some terminals (VTE-based ones, for example) send Enter and Shift+Enter as the same byte, so the chat asks the X
-server for the keyboard's modifier state the moment Enter arrives (libX11 through ctypes: no extra dependency).
-Without X, as on a console or over SSH, it answers False and Enter sends as before. AGENTCHAT_SHIFT_ENTER=0 turns it
-off. For tests, AGENTCHAT_SHIFT_FILE names a file whose existence stands in for a held Shift.
+This terminal (VTE) sends Enter and Shift+Enter as the same byte, so the chat asks the X server for the keyboard's
+modifier state the moment Enter arrives (libX11 through ctypes: no new software). Without X, as on a console or
+over SSH, it answers False and Enter sends as before. AGENTCHAT_SHIFT_ENTER=0 turns it off. For tests,
+AGENTCHAT_SHIFT_FILE names a file whose existence stands in for a held Shift.
 """
 
 import ctypes

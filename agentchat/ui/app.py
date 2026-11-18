@@ -145,10 +145,13 @@ def _loop(win, screen):
         dirty = False
         if resize_read in ready:
             _drain(resize_read)
-            size = os.get_terminal_size(sys.stdout.fileno())
-            curses.resizeterm(size.lines, size.columns)
-            win.clear()
-            dirty = True
+            try:
+                size = os.get_terminal_size(sys.stdout.fileno())
+                curses.resizeterm(size.lines, size.columns)
+            except (OSError, curses.error):  # a terminal can briefly report 0x0 mid-resize: draw at the old size
+                pass
+            win.clearok(True)               # a full repaint, inside one frame: clearing now flashed a blank screen
+            screen.draw()                   # before the next key read, whose implicit refresh would repaint first
         if wake_read in ready:
             _drain(wake_read)
             if watcher.error:

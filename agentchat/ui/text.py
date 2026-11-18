@@ -19,8 +19,8 @@ def cell_width(ch):
     """Terminal cells for one character, using only unicodedata."""
     width = _widths.get(ch)
     if width is None:
-        if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
-            width = 0
+        if unicodedata.category(ch) in ("Mn", "Me", "Cf") or "\U0001f3fb" <= ch <= "\U0001f3ff":
+            width = 0                       # skin-tone modifiers join the emoji before them: 👍🏽 is 2 cells
         elif unicodedata.east_asian_width(ch) in ("W", "F"):
             width = 2
         else:
@@ -63,9 +63,11 @@ def wrap(first, indent, segments, width, first_width=None):
     rows, row = [], list(first)
     start = text_width(indent)
     used = sum(text_width(text) for text, _ in first)
+    fresh = True                            # no word yet on this logical line: its leading indent is kept
 
     def newline():
-        nonlocal row, used, limit
+        nonlocal row, used, limit, fresh
+        fresh = False
         rows.append(row)
         row, used, limit = [(indent, 0)] if indent else [], start, width
 
@@ -73,12 +75,13 @@ def wrap(first, indent, segments, width, first_width=None):
         for number, line in enumerate(text.split("\n")):
             if number:
                 newline()
+                fresh = True
             for word in re.split(r"(\s+)", line):
                 if not word:
                     continue
                 size = text_width(word)
                 if word.isspace():
-                    if used > start and used + size <= limit:
+                    if (used > start or fresh) and used + size <= limit:
                         row.append((word, attr))
                         used += size
                     continue
@@ -97,6 +100,7 @@ def wrap(first, indent, segments, width, first_width=None):
                 if word:
                     row.append((word, attr))
                     used += size
+                    fresh = False
     rows.append(row)
     return rows
 

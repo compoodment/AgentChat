@@ -1,24 +1,27 @@
-"""Command-line entry point; the chat screen is imported only when needed."""
+"""Command-line entry point. UI is imported only when needed."""
 
 import argparse
 import json
 import math
 import sys
 
-from agentchat import store
+from agentchat import store, __version__
 
 
 def _parser():
     parser = argparse.ArgumentParser(prog="chat", description="A tiny local agent group chat")
+    parser.add_argument("--version", action="version", version=f"AgentChat {__version__}")
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("ui", help="Open the user's chat screen")
     say = commands.add_parser("say", help="Append a message")
     say.add_argument("--from", dest="sender", choices=(store.USER,) + store.AGENTS, required=True)
     say.add_argument("--kind", choices=("msg", "claim", "release"), default="msg")
+    say.add_argument("--request-id", help="Retry the same message with the same 32-character lowercase hex ID")
     say.add_argument("text", nargs="+", metavar="TEXT")
     wait = commands.add_parser("wait", help="Wait for messages after an agent's last ack")
     wait.add_argument("--as", dest="agent", choices=store.AGENTS, required=True)
     wait.add_argument("--timeout", type=float, default=25)
+    wait.add_argument("--compact", action="store_true", help="Print [id,sender,kind,text] JSON arrays")
     ack = commands.add_parser("ack", help="Acknowledge messages after handling them")
     ack.add_argument("--as", dest="agent", choices=store.AGENTS, required=True)
     ack.add_argument("id", type=int)
@@ -64,7 +67,8 @@ def main(argv=None):
             from agentchat import ui
             return ui.main()
         if args.command == "say":
-            message = store.append_message(args.sender, " ".join(args.text), args.kind)
+            message = store.append_message(args.sender, " ".join(args.text), args.kind,
+                                           request_id=args.request_id)
             print(json.dumps(message, ensure_ascii=False))
         elif args.command == "bridge":
             from agentchat import bridge
@@ -116,17 +120,20 @@ def main(argv=None):
             after = store.get_ack(args.agent)
             if args.timeout < 0 or not math.isfinite(args.timeout):
                 raise ValueError("timeout must be a finite non-negative number")
+            blocking = args.timeout > 0
             messages = store.read_messages(after)
-            if not messages:
+            if not messages and blocking:
                 store.set_presence(args.agent, "listening", ttl=args.timeout + 60)
                 if not store.wait_for_change(after, args.timeout):
                     return 2
                 messages = store.read_messages(after)
             if not messages:
                 return 2
-            store.set_presence(args.agent, "working")
+            if blocking:
+                store.set_presence(args.agent, "working")
             for message in messages:
-                print(json.dumps(message, ensure_ascii=False))
+                value = [message[key] for key in ("id", "sender", "kind", "text")] if args.compact else message
+                print(json.dumps(value, ensure_ascii=False, separators=(",", ":") if args.compact else None))
         return 0
     except BrokenPipeError:
         return 1

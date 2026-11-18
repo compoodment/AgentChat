@@ -23,6 +23,7 @@ LETTERS = {"A": curses.KEY_UP, "B": curses.KEY_DOWN, "C": curses.KEY_RIGHT, "D":
            "H": curses.KEY_HOME, "F": curses.KEY_END}
 NUMBERS = {1: curses.KEY_HOME, 7: curses.KEY_HOME, 4: curses.KEY_END, 8: curses.KEY_END, 3: curses.KEY_DC,
            5: curses.KEY_PPAGE, 6: curses.KEY_NPAGE}
+HISTORY = {"A": curses.KEY_SR, "B": curses.KEY_SF}      # curses' own Shift+Up/Down, which Composer.key handles
 WORDS = {"D": "b", "C": "f"}            # Ctrl/Alt+Left/Right move by word, as Alt+B/F do
 PRIVATE = range(57344, 63744)           # kitty's codes for keys that type nothing (keypad, media, modifiers)
 
@@ -35,6 +36,8 @@ def decode(sequence):
         modifiers, letter = int(cursor.group(1) or 1) - 1, cursor.group(2)
         if modifiers & (ALT | CTRL) and letter in WORDS:
             return ("alt", WORDS[letter])
+        if modifiers & (SHIFT | ALT | CTRL) and letter in HISTORY:
+            return ("key", HISTORY[letter])     # Shift/Alt/Ctrl+Up/Down walk the sent history
         return ("key", LETTERS[letter])
     if numbered:
         key = NUMBERS.get(int(numbered.group(1)))

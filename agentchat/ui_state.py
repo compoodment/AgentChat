@@ -58,7 +58,7 @@ def _payload(draft, cursor, chips, chip_count):
     chips = {} if chips is None else chips
     if not isinstance(chips, dict) or any(not isinstance(k, str) or not isinstance(v, str)
                                           for k, v in chips.items()):
-        raise ValueError('Draft chips must map labels to text')
+        raise ValueError('Draft chips must map keys to text')
     return {'draft': draft, 'cursor': cursor, 'chips': dict(chips), 'chip_count': chip_count}
 
 
@@ -150,6 +150,19 @@ class DraftSession:
         self._last_payload = (dict(self.restored, chips=dict(self.restored['chips']))
                               if self.restored else None)
 
+    def adopt_restored_representation(self, draft, cursor, chips, chip_count):
+        """Treat a lossless UI format conversion as the same recovered draft.
+
+        The next save or send can persist the new form. Until then the previous
+        representation and its pending receipt remain available on disk.
+        """
+        payload = _payload(draft, cursor, chips, chip_count)
+        with self._mutex:
+            if self._lock is None or self.restored is None or not draft:
+                raise ValueError('Draft representation can only be adopted after restoring a draft')
+            self._last_payload = payload
+            self.restored = None
+
     def save(self, draft, cursor, chips=None, chip_count=0):
         payload = _payload(draft, cursor, chips, chip_count)
         with self._mutex:
@@ -158,6 +171,7 @@ class DraftSession:
             store._prepare()
             if payload == self._last_payload:
                 return
+            pending = None
             if not draft:
                 try:
                     self.path.unlink()
@@ -167,12 +181,9 @@ class DraftSession:
             else:
                 record = dict(payload, version=VERSION, updated_at=time.time())
                 if self._pending is not None and self._last_payload and _same_content(payload, self._last_payload):
-                    record['pending_send'] = self._pending
-                else:
-                    self._pending = None
+                    pending = record['pending_send'] = self._pending
                 store._atomic_json(self.path, record)
-            if not draft:
-                self._pending = None
+            self._pending = pending
             self._last_payload = payload
             self.restored = None
 

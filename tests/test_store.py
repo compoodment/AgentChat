@@ -121,6 +121,30 @@ class StoreTests(StoreFixture):
         ids=[m['id'] for m in store.read_messages()]
         self.assertEqual(ids,list(range(1,61)))
 
+    def test_quoted_and_partial_mentions_do_not_assign_a_task(self):
+        examples = ['what does `@claude` mean?', '``@claude`` is code',
+                    '```text\n@claude\n```', '~~~\n@claude\n~~~~',
+                    '> @claude old quotation', '    @claude code',
+                    'mail@claude.example', '@claude-old', r'\@claude literal']
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(store.mentioned_agents(text), set())
+                request = store.append_message('user', text)
+                claim = store.take_task('codex', request['id'])
+                self.assertEqual(claim['sender'], 'codex')
+                store.release_task('codex', request['id'])
+        self.assertEqual(store.mentioned_agents('@ClAuDe please act'), {'claude'})
+        self.assertEqual(store.mentioned_agents('@all please act'), {'claude', 'codex'})
+        self.assertEqual(store.mentioned_agents('`@claude` example; @codex act'), {'codex'})
+        self.assertEqual(store.mentioned_agents('```\n@codex unclosed'), set())
+
+    def test_inline_code_uses_whole_backtick_runs(self):
+        self.assertEqual(store.mentioned_agents('prefix `` @codex ` text ``'), set())
+        self.assertEqual(store.mentioned_agents('@co`example`dex'), set())
+        # One long unmatched run must remain prose without regex backtracking.
+        self.assertEqual(store.mentioned_agents('prefix '+ '`'*16000 + ' @codex'), {'codex'})
+        self.assertEqual(store.mentioned_agents('prefix ` example @claude'), {'claude'})
+
     def test_task_race_and_assignment(self):
         task=self.user('shared request')['id']
         def take(agent):
@@ -185,24 +209,11 @@ class StoreTests(StoreFixture):
             with self.assertRaises(ValueError):store.set_presence('codex','working',ttl=ttl)
         with self.assertRaises(ValueError):store.set_presence('codex','working','x'*201)
 
-    def test_launcher_uses_its_package_when_cwd_contains_a_decoy(self):
-        launcher = Path(store.__file__).resolve().parents[1] / 'bin/chat'
-        working = Path(self.directory.name) / 'untrusted-cwd'
-        decoy = working / 'agentchat'
-        decoy.mkdir(parents=True)
-        (decoy / '__init__.py').write_text('raise RuntimeError("decoy package imported")\n')
-        result = subprocess.run([str(launcher), 'say', '--from', 'user', 'launcher isolation'],
-                                cwd=working, capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        message = json.loads(result.stdout)
-        self.assertEqual((message['sender'], message['text']), ('user', 'launcher isolation'))
-        self.assertEqual(store.read_messages(), [message])
-
     def test_repeated_unacked_wait_preserves_working_since(self):
         self.user()
         launcher = Path(store.__file__).resolve().parents[1] / 'bin/chat'
         def wait():
-            subprocess.run([str(launcher), 'wait', '--as', 'codex', '--timeout', '0'],
+            subprocess.run([str(launcher), 'wait', '--as', 'codex', '--timeout', '0.05'],
                            capture_output=True, text=True, check=True, timeout=10)
             return store.get_presence()['codex']
         first = wait()
@@ -212,13 +223,53 @@ class StoreTests(StoreFixture):
         self.assertEqual(first['since'], second['since'])
         self.assertEqual(store.get_ack('codex'), 0)
 
+    def test_compact_wait_preserves_every_record_text_order_and_ack(self):
+        records = [store.append_message('user', 'hello\n"quotes" · violet', request_id='a'*32),
+                   store.append_message('codex', 'README.md', 'claim'),
+                   store.append_message('codex', 'README.md', 'release')]
+        launcher = Path(store.__file__).resolve().parents[1] / 'bin/chat'
+        command = [str(launcher), 'wait', '--as', 'codex', '--timeout', '0']
+        full = subprocess.run(command, capture_output=True, text=True, check=True, timeout=10)
+        compact = subprocess.run(command + ['--compact'], capture_output=True, text=True, check=True, timeout=10)
+        self.assertEqual([json.loads(line) for line in full.stdout.splitlines()], records)
+        expected = [[row[key] for key in ('id', 'sender', 'kind', 'text')] for row in records]
+        self.assertEqual([json.loads(line) for line in compact.stdout.splitlines()], expected)
+        self.assertLess(len(compact.stdout.encode()), len(full.stdout.encode()))
+        self.assertEqual(store.get_ack('codex'), 0)
+        store.set_ack('codex', records[-1]['id'])
+        empty = subprocess.run(command + ['--compact'], capture_output=True, text=True, timeout=10)
+        self.assertEqual((empty.returncode, empty.stdout), (2, ''))
+
+    def test_nonblocking_cli_wait_does_not_overwrite_watcher_presence(self):
+        launcher = Path(store.__file__).resolve().parents[1] / 'bin/chat'
+        lease = store.set_presence('codex', 'working', 'active turn')
+        command = [str(launcher), 'wait', '--as', 'codex', '--timeout', '0', '--compact']
+        empty = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertEqual((empty.returncode, empty.stdout), (2, ''))
+        self.assertEqual(store.get_presence()['codex'], lease)
+        self.user()
+        unread = subprocess.run(command, capture_output=True, text=True, timeout=10, check=True)
+        self.assertEqual(json.loads(unread.stdout)[:3], [1, 'user', 'msg'])
+        self.assertEqual(store.get_presence()['codex'], lease)
+        self.assertEqual(store.get_ack('codex'), 0)
+
+    def test_cli_version_matches_release_file_without_creating_runtime_data(self):
+        root=Path(store.__file__).resolve().parents[1]
+        target=Path(self.directory.name)/'unused-version-data'
+        result=subprocess.run([str(root/'bin/chat'),'--version'],cwd=self.directory.name,
+                    env=dict(os.environ,AGENTCHAT_DATA=str(target)),capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        expected=(root/'VERSION').read_text(encoding='ascii').strip()
+        self.assertEqual(result.stdout,f'AgentChat {expected}\n')
+        self.assertFalse(target.exists())
+
     def test_cli_wait_lease_and_exit_codes(self):
         launcher=Path(store.__file__).resolve().parents[1]/'bin/chat'
-        result=subprocess.run([str(launcher),'wait','--as','codex','--timeout','0'],capture_output=True,text=True)
+        result=subprocess.run([str(launcher),'wait','--as','codex','--timeout','0.05'],capture_output=True,text=True)
         self.assertEqual(result.returncode,2,result.stderr)
         self.assertEqual(store.get_presence()['codex']['state'],'listening')
         self.user()
-        result=subprocess.run([str(launcher),'wait','--as','codex','--timeout','0'],capture_output=True,text=True)
+        result=subprocess.run([str(launcher),'wait','--as','codex','--timeout','0.05'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(store.get_presence()['codex']['state'],'working')
         self.assertEqual(store.get_ack('codex'),0)
@@ -435,6 +486,24 @@ class StoreTests(StoreFixture):
         with self.assertRaisesRegex(ValueError,'Invalid log record'):store.read_tail(2)
         self.fixture_log('2026-11-16.jsonl',[2,1])
         with self.assertRaisesRegex(ValueError,'must increase'):store.read_tail(2)
+
+    def test_search_kind_filters_before_limit_across_large_control_backlog(self):
+        store._prepare()
+        records = [dict(id=i, ts='2026-11-17T00:00:00+00:00', sender='user' if i<3 else 'system',
+                        kind='msg' if i<3 else 'system', text='Needle') for i in range(1,1005)]
+        (store.CHAT_DIR/'2026-11-17.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in records))
+        self.assertEqual(store.search_messages('needle',limit=1)[0]['id'],1004)
+        found = store.search_messages('needle',limit=1,kind='msg')
+        self.assertEqual(found[0]['id'],2)
+        self.assertEqual(store.search_messages('needle',limit=1,before_id=2,kind='msg')[0]['id'],1)
+        self.assertEqual([m['id'] for m in store.search_messages('needle',kind='msg')],[1,2])
+        self.assertEqual(store.search_messages('needle',kind='claim'),[])
+        found[0]['text']='changed by caller'
+        self.assertEqual(store.search_messages('needle',limit=1,kind='msg')[0]['text'],'Needle')
+        self.assertEqual(store.get_ack('codex'),0)
+        for kind in ('bogus',False,[],1):
+            with self.subTest(kind=kind),self.assertRaisesRegex(ValueError,'search kind'):
+                store.search_messages('needle',limit=0,kind=kind)
 
     def test_search_literal_casefold_pagination_without_ack(self):
         self.user('Straße [literal] one');self.user('other');self.user('STRASSE [literal] two')

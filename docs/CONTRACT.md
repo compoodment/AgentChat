@@ -85,12 +85,14 @@ set_autonomy(seconds) -> guard_status dict  # legacy wrapper
 ## CLI (`bin/chat`)
 ```
 chat                         open the chat screen (same as `chat ui`)
-chat say --from user|claude|codex [--kind msg|claim|release] TEXT
+chat say --from user|claude|codex [--kind msg|claim|release] [--request-id ID] TEXT
                              post; prints the stored message as JSON. Exits 1 with the reason
                              on GuardBlocked / ClaimConflict. `--from system` and `--kind system` are refused.
-chat wait --as <agent> [--timeout N]
+chat wait --as <agent> [--timeout N] [--compact]
                              print messages after <agent>'s ack (JSON lines), exit 0;
                              exit 2 if none arrived before the timeout. Does not ack.
+                             --timeout 0 reads once without changing presence.
+                             --compact prints [id,sender,kind,text] arrays.
 chat ack --as <agent> <id>   record a successful turn
 chat take --as <agent> <id>  atomically claim a user request; JSON claim on success, exit 1 on conflict
 chat release-task --as <agent> <id>
@@ -110,8 +112,10 @@ chat release-task --as <agent> <id>
 - Task claims
   and releases are drawn under the user message they refer to. An agent's messages less than three minutes apart
   share one header; each keeps its own `#id` and time.
-- The draft is saved about a second after the last edit and cleared only after a send succeeds. Bracketed paste
-  (`ESC[200~`…`ESC[201~`) is inserted as text; pastes over 1,000 characters or 12 lines become a chip.
+- The draft is saved about a second after the last edit and cleared only after a send succeeds.
+  Bracketed pastes over 1,000 characters or 12 lines become one unit in the composer. Inserting or
+  removing adjacent text moves the chip with the surrounding draft. The stored message contains the
+  full pasted text.
 - The read marker moves only after a key or focus-in at the live bottom of the transcript, written off the input thread.
 - Focus reporting (`ESC[?1004h`) drives desktop notifications (`notify-send`, off with `AGENTCHAT_NOTIFY=0`) for
   mentions while unfocused, and an `AgentChat (N)` window title counting arrivals while away.
@@ -122,7 +126,7 @@ chat release-task --as <agent> <id>
   run on the input path.
 
 ## Agent behaviour
-The join loop is in `README.md#how-it-runs`. The rules are in `AGENTS.md`.
+See the [CLI join loop](../README.md#join-with-the-cli) and the [contributor rules](../AGENTS.md).
 
 ## Presence and cheap reads
 - `last_id()` returns the latest committed log id, or 0 for an empty log. Sequence metadata alone is
@@ -131,8 +135,8 @@ The join loop is in `README.md#how-it-runs`. The rules are in `AGENTS.md`.
   entries are returned as `unknown` by `get_presence`. Times are UTC Unix seconds; absent times are null.
 - `since` is the start of the current state; `updated_at` is the latest heartbeat; `expires_at` bounds the
   claim. State continuity ends when a lease expires. `note` is a short plain string (at most 200 characters).
-- Default lease is 900 seconds. CLI `wait` returns an already unread inbox directly as `working`,
-  preserving that state’s start time. Otherwise it sets `listening` for `timeout + 60` seconds, then
+- Default lease is 900 seconds. A blocking CLI `wait` returns an already unread inbox as `working`,
+  preserving that state's start time. Otherwise it sets `listening` for `timeout + 60` seconds, then
   `working` on delivery. A process that stops without updating presence eventually becomes `unknown`.
 - `chat status --as <agent> listening|working|idle [--note TEXT]` writes presence and prints JSON.
 - Presence lives in `data/presence/<agent>.json`, atomically replaced under a separate per-agent lock.
@@ -206,6 +210,7 @@ state off its input/render thread, since those are full integrity scans.
 ## Idempotent user sends
 - `request_id` is optional for message-kind records: exactly 32 lowercase hexadecimal characters.
   Legacy records and CLI/agent calls without it retain their existing shape and behavior.
+- The CLI's `--request-id ID` and the MCP post tool's `request_id` use the same send receipt.
 - Under the log lock, retrying the same request id with identical sender/kind/text returns the original
   record after confirming log durability. Reusing it for different content is rejected. Duplicate
   request ids in the committed log are corruption, not two legitimate deliveries.
@@ -231,6 +236,7 @@ state off its input/render thread, since those are full integrity scans.
   failure is visible in status/presence. A newer user message reopens delivery without skipping the
   older inbox; manual retry is also available. Native active turns are never requeued.
 - Posting policy is checked before waking. Pause/wait and rate delays are handled by the local process.
+- The watcher rechecks stop, policy and acknowledgments after checking native session state.
 - Durable state, private log and singleton locks live in data/bridge/. Stop wakes the local process
   through inotify and never sends a signal to a PID from metadata. No network listener is opened.
 - `chat bridge probe` requests a same-session diagnostic wake. The notified agent runs

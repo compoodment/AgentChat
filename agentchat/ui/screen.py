@@ -3,11 +3,13 @@
 import curses
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
 
 from agentchat import store, ui_state
+from agentchat.ui import composer
 from agentchat.ui.composer import QUIT_WINDOW, Composer
 from agentchat.ui.desktop import Desktop
 from agentchat.ui.render import Renderer
@@ -58,6 +60,8 @@ class Screen(Renderer, Composer):
         self.tasks = {}             # user message id -> [(kind, agent)] from task claims/releases
         self.expanded = set()       # ids of long agent messages opened with /open
         self.body_height = 20       # transcript rows at the last draw, for /find jumps
+        self.hint_shown = False     # whether that draw had the scroll/history hint row
+        self.rows_top, self.shown_rows, self.row_owners = 0, [], []   # the drawn transcript, for clicks
         self.found = None           # (query, id) of the last /find match
         self.highlight = None       # the /find words shown highlighted, until Esc or a send
         self.view = None            # older messages shown by /find; None means the live transcript
@@ -101,7 +105,9 @@ class Screen(Renderer, Composer):
         self.pasting = None         # list of characters collected inside a bracketed paste
         self.chips = {}             # paste chip label -> the full pasted text
         self.chip_count = 0         # chip numbers never repeat within a session
-        self.saved_draft = ""       # the draft in progress while browsing history
+        self.saved_draft = ("", {})  # the draft in progress and its chips, while browsing history
+        self.stash_chips = {}       # the chips of a draft cleared with Esc Esc
+        self.chip_numbers = {}      # a chip moved to a new character keeps the number its label shows
         self.drawn_minute = 0       # activity durations redraw once a minute
         self.running = True
         self._colors()
@@ -112,6 +118,7 @@ class Screen(Renderer, Composer):
                      "error": A.A_BOLD, "meta": A.A_DIM, "me": A.A_REVERSE | A.A_BOLD,
                      "band": 0, "rule": A.A_DIM, "key": A.A_BOLD, "code": A.A_BOLD, "menu_on": A.A_REVERSE,
                      "found": A.A_REVERSE, "sending": A.A_DIM}
+        self.on_band = {}                   # colour pair -> the same colour on your messages' band
         if os.environ.get("NO_COLOR") or not curses.has_colors():
             return
         curses.use_default_colors()
@@ -135,6 +142,16 @@ class Screen(Renderer, Composer):
             self.attr["band"] = curses.color_pair(8)
             curses.init_pair(9, palette["user"], band)
             self.attr["user_band"] = curses.color_pair(9) | curses.A_BOLD
+        # @claude / @codex in text: the agents' colours, paler than their names in headers but easy to read
+        soft = {"claude": (137 if light else 180) if rich else curses.COLOR_YELLOW,
+                "codex": (97 if light else 146) if rich else curses.COLOR_MAGENTA}
+        for number, (name, color) in enumerate(soft.items(), 12):
+            curses.init_pair(number, color, -1)
+            self.attr[f"{name}_mention"] = curses.color_pair(number)
+        if rich and curses.COLOR_PAIRS > 33:   # every coloured style on the band keeps the band behind it: a pair
+            for pair in (1, 2, 3, 4, 10, 12, 13):   # with the default background punched a dark hole there
+                curses.init_pair(20 + pair, curses.pair_content(pair)[0], band)
+                self.on_band[pair] = 20 + pair
 
     # -- data -------------------------------------------------------------
 
@@ -214,8 +231,42 @@ class Screen(Renderer, Composer):
         if restored:
             self.draft, self.cursor = restored["draft"], restored["cursor"]
             self.chips, self.chip_count = dict(restored["chips"]), restored["chip_count"]
+            if self._adopt_label_chips():   # the same draft in the new form: keep its pending send receipt
+                self.drafts.adopt_restored_representation(self.draft, self.cursor, self.chips, self.chip_count)
             self.note("Restored your unsent draft")
         self.saved_state = self._draft_state()
+
+    def _adopt_label_chips(self):
+        """A draft saved before chips were single characters keyed them by label text and expanded every
+        occurrence in one scan, longest label first. The same scan swaps each occurrence for that paste's chip
+        character. True only when the converted draft provably sends the same text (then the pending send
+        receipt can stay); otherwise the draft counts as changed."""
+        legacy = sorted((key for key in self.chips if not composer.is_chip(key)), key=len, reverse=True)
+        if not legacy:
+            return False
+        before = re.sub("|".join(map(re.escape, legacy)), lambda match: self.chips[match.group(0)], self.draft)
+        keys = {}
+        for label in legacy:
+            number = re.search(r"#(\d+)", label)      # the number its label showed before restoring
+            chip = self._fresh_chip(avoid="".join(keys.values()))
+            keys[label] = chip
+            self.chip_numbers[chip] = int(number.group(1)) if number else self.chip_count + 1
+            self.chip_count = max(self.chip_count, self.chip_numbers[chip])
+        built, cursor, at = "", None, 0
+        for match in re.finditer("|".join(map(re.escape, legacy)), self.draft):
+            if cursor is None and self.cursor <= match.start():
+                cursor = len(built) + self.cursor - at          # before this label: carried with the text
+            built += self.draft[at:match.start()] + keys[match.group(0)]
+            if cursor is None and self.cursor < match.end():
+                cursor = len(built)                             # inside the label: just after its chip
+            at = match.end()
+        if cursor is None:
+            cursor = len(built) + self.cursor - at
+        built += self.draft[at:]
+        texts = {keys[label]: self.chips.pop(label) for label in legacy}
+        self.draft, self.cursor = built, min(cursor, len(built))
+        self.chips = {chip: text for chip, text in {**self.chips, **texts}.items() if chip in self.draft}
+        return self.expand(self.draft) == before
 
     def _draft_state(self):
         return (self.draft, self.cursor, dict(self.chips), self.chip_count)
@@ -269,6 +320,7 @@ class Screen(Renderer, Composer):
                 self.note(f"Not sent: {reason} · your text is still here, press Enter to retry", "error", sticky=True)
                 continue
             self.draft, self.cursor, self.history_pos, self.stash, self.chips = "", 0, None, "", {}
+            self.stash_chips = {}
             self.saved_state = self._draft_state()  # the send cleared the saved draft
             self.scroll, self.unseen, self.view = 0, {}, None
             self.notes = [n for n in self.notes if n[1] != "error"]
@@ -349,7 +401,10 @@ class Screen(Renderer, Composer):
         self.claims, self.presence = claims, presence
         changed = (guard, claims, presence) != before
         if latest > self.last_id:           # a wake was missed: catch up now instead of on the next key
-            self.refresh_data()
+            try:
+                self.refresh_data()
+            except (ValueError, OSError) as error:   # a bad log line: say so, keep the screen and the draft
+                self.note(f"Store error: {error}", "error")
             changed = True
         return changed
 
@@ -358,7 +413,7 @@ class Screen(Renderer, Composer):
         paused and wait have no retry time, so they never get one (that would refresh in a loop)."""
         self.guard = guard
         retry = guard.get("retry_after")
-        rate = guard.get("mode") in ("normal", "custom", "auto")
+        rate = guard.get("mode") in ("normal", "custom", "auto", "autonomous")
         timed = guard.get("blocked") and rate and isinstance(retry, (int, float)) and retry > 0
         self.retry_deadline = time.monotonic() + retry if timed else None
 

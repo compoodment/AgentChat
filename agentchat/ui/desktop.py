@@ -42,7 +42,7 @@ class Desktop:
             self.notifier = _claim(f"{self.prefix}notifier")
             if self.notifier is None:    # another screen holds the name: it pops up for this mention
                 return False
-        threading.Thread(target=subprocess.run, args=([command, "-a", "AgentChat", title, body],), daemon=True,
+        threading.Thread(target=subprocess.run, args=([command, "-a", "AgentChat", "--", title, body],), daemon=True,
                          kwargs={"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}).start()
         return True
 

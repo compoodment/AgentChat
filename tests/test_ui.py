@@ -24,7 +24,6 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = str(ROOT / "bin" / "chat")
-SCRATCH = tempfile.gettempdir()        # throwaway data folders go here (honours TMPDIR)
 
 
 def _cells(ch):
@@ -225,7 +224,7 @@ class ChatScreen:
         """Pump output until condition() holds; return whether it did. Replaces fixed sleeps.
 
         Generous by design: a passing check returns at once, but in the gate the store suite runs in
-        parallel and its fsyncs can delay a large journalled send on a slow drive by several seconds.
+        parallel and its fsyncs can delay a large journalled send on the USB drive by several seconds.
         """
         end = time.time() + seconds
         while time.time() < end:
@@ -282,7 +281,7 @@ from agentchat import store
 _atomic_json = store._atomic_json
 
 def _journal(path, value):
-    # Only the pending-send journal write: that is the step that blocks when the disk stalls.
+    # Only the pending-send journal write, where the real stall happened.
     if isinstance(value, dict) and "pending_send" in value:
         while os.path.exists(os.environ["AGENTCHAT_TEST_GATE"]):
             time.sleep(0.05)
@@ -347,7 +346,8 @@ class ChipTests(unittest.TestCase):
         screen.highlight, screen.cache = None, {}
         screen.writer, screen.sending = None, None
         screen.draft, screen.cursor, screen.history_pos = "", 0, None
-        screen.chips, screen.chip_count = {}, 0
+        screen.chips, screen.chip_count, screen.chip_numbers = {}, 0, {}
+        screen.history, screen.stash, screen.stash_chips, screen.saved_draft = [], "", {}, ("", {})
         screen.notes, screen.help, screen.ctrl_c_at, screen.running = [], False, 0, True
         screen.menu_index, screen.menu_closed = 0, False
         screen.win = type("Window", (), {"getmaxyx": lambda self: (24, 80)})()
@@ -366,17 +366,76 @@ class ChipTests(unittest.TestCase):
         screen.key("\x7f")
         self.assertEqual((screen.draft, screen.chips), ("", {}))
 
-    def test_edits_inside_a_label_act_on_the_whole_chip(self):
+    def test_a_chip_edits_as_one_unit(self):
         screen = self.screen()
         screen.insert("hi ")
         screen.paste("y" * 2000)
-        label = next(iter(screen.chips))
-        screen.cursor = 3 + 5               # inside the label
-        screen.insert("Z")                  # typing jumps past the chip
-        self.assertIn(label, screen.draft)
-        screen.cursor = 3 + 5
-        screen.key(curses_key("KEY_DC"))
+        screen.insert("Z")
+        self.assertEqual(len(screen.draft), len("hi Z") + 1)  # the chip is one character in the draft
+        screen.cursor = 3
+        screen.key(curses_key("KEY_DC"))                      # Delete at the chip removes all of it
         self.assertEqual((screen.draft, screen.chips), ("hi Z", {}))
+
+    def test_a_draft_saved_with_label_keyed_chips_still_sends_its_paste(self):
+        screen = self.screen()
+        label = "[Pasted text #3 · 2 lines]"
+        screen.draft, screen.cursor, screen.chip_count = f"see {label} ok", 4 + len(label) + 3, 3
+        screen.chips = {label: "a\nb"}
+        screen._adopt_label_chips()
+        self.assertEqual(screen.expand(screen.draft), "see a\nb ok")
+        self.assertEqual(screen.cursor, len(screen.draft))
+
+    def test_literal_unicode_survives_every_input_path(self):
+        # Codex's review of the first chip fix: private-use glyphs were dropped, and recall/stash split text from chips
+        glyph = "\ue0b0"                                    # a Powerline separator
+        screen = self.screen()
+        screen.paste(f"prompt {glyph} here")
+        self.assertEqual(screen.draft, f"prompt {glyph} here")
+        screen = self.screen()
+        screen.paste("p" * 1001)                            # a chip...
+        chip = next(iter(screen.chips))
+        screen.insert(f" and {chip} typed")                 # ...and its own character as literal text
+        self.assertEqual(screen.expand(screen.draft), "p" * 1001 + f" and {chip} typed")
+
+    def test_recall_and_stash_move_text_and_chips_together(self):
+        screen = self.screen()
+        screen.paste("q" * 1001)
+        chip = next(iter(screen.chips))
+        screen.history = [f"sent earlier with {chip} in it"]   # literal text that equals the parked chip's key
+        screen.recall(-1)
+        self.assertEqual(screen.expand(screen.draft), f"sent earlier with {chip} in it")
+        screen.recall(1)                                    # back to the parked draft, its paste intact
+        self.assertEqual(screen.expand(screen.draft), "q" * 1001)
+        screen.stash, screen.stash_chips = screen.draft, dict(screen.chips)   # Esc Esc
+        screen.draft, screen.cursor, screen.chips = "", 0, {}
+        screen.insert("other draft")
+        screen.cut(0, 5)                                    # edits elsewhere used to drop the stash's chip
+        screen.history = []
+        screen.recall(-1)
+        self.assertEqual(screen.expand(screen.draft), "q" * 1001)
+
+    def test_a_legacy_label_used_twice_converts_both_and_proves_it(self):
+        # Legacy expansion applied to every occurrence. Converting only the first then calling
+        # the draft unchanged kept a pending receipt for different text
+        screen = self.screen()
+        short, long = "[Pasted text #1 · 2 lines]", "[Pasted text #12 · 3 lines]"
+        screen.chips, screen.chip_count = {short: "a\nb", long: "x\ny\nz"}, 12
+        screen.draft = f"{short} then {long} and {short} end"
+        screen.cursor = screen.draft.index(long) + 3              # inside the long label
+        self.assertTrue(screen._adopt_label_chips())
+        self.assertEqual(screen.expand(screen.draft), "a\nb then x\ny\nz and a\nb end")
+        self.assertEqual(screen.draft[screen.cursor - 1], next(c for c, t in screen.chips.items() if t == "x\ny\nz"))
+        self.assertEqual(screen.composer_lines(200)[0][0].count(short), 2)    # both drawn with their old label
+
+    def test_typed_text_that_looks_like_a_label_stays_text(self):
+        # A typed label keeps its own text when a subsequent paste creates a chip.
+        screen = self.screen()
+        typed = "[Pasted text #1 · 1001 chars] "
+        screen.insert(typed)
+        screen.paste("p" * 1001)
+        self.assertEqual(screen.expand(screen.draft), typed + "p" * 1001)
+        self.assertEqual(screen.chip_spans(), [(len(typed), len(typed) + 1)])
+        self.assertIn("[Pasted text #1 · 1001 chars]", screen.composer_lines(80)[0][0])   # drawn as its label
 
 
 def curses_key(name):
@@ -398,6 +457,137 @@ class GroupingTests(unittest.TestCase):
         self.assertTrue(screen._continues(aware, dict(aware, ts="2026-11-16T10:01:00+01:00")))
 
 
+class DraftEditingTests(unittest.TestCase):
+    """Up/Down by screen row, edits of recalled entries, and pasted control characters."""
+
+    def screen(self, width=20):
+        import sys
+        sys.path.insert(0, str(ROOT))
+        from agentchat import ui
+        screen = ChipTests.screen(self)
+        screen.history, screen.stash, screen.saved_draft = ["old message"], "", ("", {})
+        screen.win = type("Window", (), {"getmaxyx": lambda self: (24, width)})()
+        return screen
+
+    def test_up_and_down_move_through_a_wrapped_line_then_to_its_ends(self):
+        screen = self.screen()                       # 18 cells a row: 40 characters wrap onto three rows
+        screen.draft, screen.cursor = "a" * 40, 40
+        screen.vertical(-1)
+        self.assertEqual((screen.draft, screen.cursor), ("a" * 40, 22))
+        screen.vertical(-1)
+        self.assertEqual(screen.cursor, 4)
+        screen.vertical(1)
+        self.assertEqual(screen.cursor, 22)
+        screen.vertical(-1)
+        screen.vertical(-1)                           # past the top row: the start of the draft, not the history
+        self.assertEqual((screen.draft, screen.cursor), ("a" * 40, 0))
+        screen.vertical(-1)
+        self.assertEqual((screen.draft, screen.cursor), ("a" * 40, 0))
+        screen.cursor = 30
+        screen.vertical(1)                            # past the bottom row: the very end
+        self.assertEqual((screen.draft, screen.cursor), ("a" * 40, 40))
+
+    def test_up_on_an_empty_draft_recalls_and_down_walks_back(self):
+        screen = self.screen()
+        screen.vertical(-1)
+        self.assertEqual(screen.draft, "old message")
+        screen.vertical(-1)                           # recalled from an empty box: Up keeps walking back
+        self.assertEqual(screen.draft, "old message")
+        screen.vertical(1)
+        self.assertEqual(screen.draft, "")
+
+    def test_shift_up_and_down_walk_the_history_with_text_in_the_box(self):
+        import curses
+        screen = self.screen(width=80)
+        screen.draft, screen.cursor = "half typed", 4
+        screen.key(curses.KEY_SR)
+        self.assertEqual((screen.draft, screen.cursor), ("old message", 11))
+        screen.key(curses.KEY_SF)
+        self.assertEqual((screen.draft, screen.cursor), ("half typed", 10))   # the draft comes back untouched
+
+    def test_an_edited_recalled_entry_is_not_discarded_by_up(self):
+        screen = self.screen(width=80)
+        screen.history.append("newer")
+        screen.vertical(-1)
+        self.assertEqual(screen.draft, "newer")
+        screen.cut(len(screen.draft) - 1, len(screen.draft))   # Backspace
+        screen.cursor = len(screen.draft)
+        screen.recall(-1)                             # browsing again starts afresh from this edit
+        screen.recall(1)
+        self.assertEqual(screen.draft, "newe")
+
+    def typed(self, draft, cursor=None):
+        screen = self.screen(width=80)
+        screen.draft, screen.cursor = draft, len(draft) if cursor is None else cursor
+        return screen
+
+    def test_a_new_line_continues_a_numbered_list(self):
+        for text, expected in (("4. four", "4. four\n5. "), ("9) nine", "9) nine\n10) "), ("  2. x", "  2. x\n  3. "),
+                               ("hi\n7. x", "hi\n7. x\n8. ")):
+            for press in (lambda s: s.key("\n"), lambda s: s.alt_keys()["\r"]()):    # Ctrl+J, Alt+Enter
+                screen = self.typed(text)
+                press(screen)
+                self.assertEqual((screen.draft, screen.cursor), (expected, len(expected)), text)
+
+    def test_a_new_line_continues_a_bullet_list_and_keeps_the_bullet(self):
+        for bullet in ("-", "*", "\u2022"):
+            screen = self.typed(f"  {bullet} item")
+            screen.newline()
+            self.assertEqual(screen.draft, f"  {bullet} item\n  {bullet} ")
+
+    def test_a_lone_first_number_starts_a_list(self):
+        for text, expected in (("1.", "1.\n2. "), ("1. ", "1. \n2. "), ("notes\n1)", "notes\n1)\n2) ")):
+            screen = self.typed(text)
+            screen.newline()
+            self.assertEqual((screen.draft, screen.cursor), (expected, len(expected)), text)
+
+    def test_a_new_line_on_an_empty_item_ends_the_list(self):
+        for text, expected in (("4. a\n5. ", "4. a\n"), ("- a\n  - ", "- a\n")):
+            screen = self.typed(text)
+            screen.newline()
+            self.assertEqual((screen.draft, screen.cursor), (expected, len(expected)))
+
+    def test_a_new_line_elsewhere_is_plain(self):
+        for text, cursor in (("4.5 apples", None), ("-5 degrees", None), ("*bold*", None), ("4. four", 1)):
+            screen = self.typed(text, cursor)
+            at = screen.cursor
+            screen.newline()
+            self.assertEqual(screen.draft, text[:at] + "\n" + text[at:], text)
+
+    def test_pasted_lists_are_not_renumbered_and_enter_is_unchanged(self):
+        screen = self.typed("4. four")
+        screen.paste("\n5. five\n")
+        self.assertEqual(screen.draft, "4. four\n5. five\n")
+        screen = self.typed("4. four")
+        screen.insert("\n")
+        self.assertEqual(screen.draft, "4. four\n")
+
+    def test_the_shift_enter_report_continues_the_list(self):
+        screen = self.typed("4. four")
+        screen.pasting = None
+        screen.pending = ["\x1b", "[", "1", "3", ";", "2", "u"]
+        screen.interacted = False
+        screen.handle_pending()
+        self.assertEqual(screen.draft, "4. four\n5. ")
+
+    def test_find_asks_the_store_for_older_messages_only(self):
+        from unittest import mock
+        from agentchat import store
+        screen = self.screen(width=80)
+        screen.messages, screen.view, screen.found = [{"id": 900, "kind": "msg", "text": "recent"}], None, None
+        asked = []
+        with mock.patch.object(store, "search_messages", lambda *a, **k: asked.append((a, k)) or []), \
+                mock.patch.object(screen, "set_highlight", create=True):
+            screen.find("needle")
+        self.assertEqual(asked, [(("needle",), {"limit": 1, "before_id": 900, "kind": "msg"})])
+        self.assertIn("No older message", screen.notes[-1][0])
+
+    def test_pasted_tabs_become_spaces_and_control_codes_go(self):
+        screen = self.screen(width=80)
+        screen.paste("a\tb\x07c\x1bd\ne")
+        self.assertEqual(screen.draft, "a    bcd\ne")
+
+
 class ReplyCommandTests(unittest.TestCase):
     def test_only_the_exact_reply_command_is_rewritten(self):
         import sys
@@ -416,14 +606,17 @@ class ReplyCommandTests(unittest.TestCase):
                 mock.patch.object(screen, "refresh_data", create=True):
             screen.submit("/reply 7 sure")
             screen.submit("  /reply 8   with spaces")
+            screen.submit("/reply 9\nfrom a new line")
+            screen.submit("/reply")                 # bare, and number-only: usage, not a crash
+            screen.submit("/reply 42")
             screen.submit("/reply7 nope")
             screen.submit("/replying")
-        self.assertEqual(sent, ["↪ #7 sure", "↪ #8 with spaces"])
+        self.assertEqual(sent, ["↪ #7 sure", "↪ #8 with spaces", "↪ #9 from a new line"])
         self.assertIn("Unknown command", screen.notes[0][0])
 
 
 class ModeTests(unittest.TestCase):
-    """Mode commands and the footer, against a stand-in for the store's set_policy API."""
+    """Mode commands and the footer, against a stand-in for Codex's set_policy API."""
 
     def screen(self):
         import sys
@@ -482,7 +675,10 @@ class ModifiedKeyTests(unittest.TestCase):
             "[D": ("key", curses.KEY_LEFT), "[H": ("key", curses.KEY_HOME), "OF": ("key", curses.KEY_END),
             "[1~": ("key", curses.KEY_HOME), "[4~": ("key", curses.KEY_END), "[3~": ("key", curses.KEY_DC),
             "[3;5~": ("key", curses.KEY_DC), "[5~": ("key", curses.KEY_PPAGE), "[6~": ("key", curses.KEY_NPAGE),
-            "[1;2A": ("key", curses.KEY_UP), "[1;5D": ("alt", "b"), "[1;3C": ("alt", "f"),
+            "[1;5D": ("alt", "b"), "[1;3C": ("alt", "f"),
+            "[1;2A": ("key", curses.KEY_SR), "[1;2B": ("key", curses.KEY_SF),     # Shift, Alt, Ctrl + Up/Down walk
+            "[1;3A": ("key", curses.KEY_SR), "[1;3B": ("key", curses.KEY_SF),     # the history (xterm and kitty)
+            "[1;5A": ("key", curses.KEY_SR), "[1;5B": ("key", curses.KEY_SF), "[1;2:1A": ("key", curses.KEY_SR),
         })
         for sequence, expected in cases.items():
             self.assertEqual(decode(sequence), expected, sequence)
@@ -505,7 +701,7 @@ class MentionTests(unittest.TestCase):
 class ScreenCase(unittest.TestCase):
     """Starts bin/chat in a pty with its own throwaway data. Holds no tests itself."""
     def setUp(self):
-        self.folder = tempfile.TemporaryDirectory(prefix="agentchat-ui-", dir=SCRATCH)
+        self.folder = tempfile.TemporaryDirectory(prefix="agentchat-ui-")
         self.data = os.path.join(self.folder.name, "data")
         self.screen = None
         self.others = []                    # extra screens a test opens; stopped before the folder goes
@@ -587,12 +783,19 @@ class ChatScreenTests(ScreenCase):
     def test_mentions_of_the_user_are_marked(self):
         screen = self.open()
         screen.chat("say", "--from", "codex", "@user please look at this")
-        self.assertTrue(screen.until(lambda: "→ you" in screen.term.text() and "▌" in screen.term.text()))
+        self.assertTrue(screen.until(lambda: "▌ @user please look" in screen.term.text()))
+        self.assertNotIn("→ you", screen.term.text())   # the bar marks it; a badge as well was one blob
 
     def test_resizing_down_and_up_redraws(self):
         screen = self.open(50)
+        screen.pump(0.5)
+        start = len(screen.raw)
         screen.resize(12, 40)
         self.assertIn("❯", screen.term.text())
+        screen.pump(0.5)
+        outside = re.sub(rb"\x1b\[\?2026h.*?\x1b\[\?2026l", b"", screen.raw[start:], flags=re.S)
+        self.assertNotIn(b"\x1b[2J", outside)       # every repaint is inside a frame: no blank flash between
+        self.assertIn(b"\x1b[2J", screen.raw[start:])
         screen.resize(24, 80)
         self.assertIn("❯", screen.term.text())
         self.assertGreater(sum(1 for line in screen.term.text().splitlines() if line.strip()), 12)
@@ -634,15 +837,38 @@ class ChatScreenTests(ScreenCase):
         self.assertTrue(screen.until(lambda: "row 39" in screen.term.text() and fold not in screen.term.text()))
 
     def test_find_jumps_to_an_older_message(self):
+        seed(self.data, 31)                 # written straight to the log: 31 CLI posts took ~6 s
+        log = next((Path(self.data) / "chat").glob("*.jsonl"))
+        lines = log.read_text().splitlines()
+        lines[0] = json.dumps(dict(json.loads(lines[0]), text="the needle is here"))
+        log.write_text("\n".join(lines) + "\n")
         screen = self.open()
-        screen.chat("say", "--from", "codex", "the needle is here")
-        for n in range(30):
-            screen.chat("say", "--from", "user", f"filler message {n}")
-        self.assertTrue(screen.until(lambda: "filler message 29" in screen.term.text()))
+        self.assertTrue(screen.until(lambda: "#31" in screen.term.text()))
         self.assertNotIn("the needle is here", screen.term.text())
         screen.type("/find NEEDLE\r")
         self.assertTrue(screen.until(lambda: "the needle is here" in screen.term.text()
                                      and "Found #1" in screen.term.text()))
+
+    def test_a_draft_saved_with_label_chips_reopens_and_sends_once(self):
+        # drafts saved before chips were single characters keyed them by label: they still send, exactly once
+        label, paste = "[Pasted text #1 · 3 lines]", "one\ntwo 🟣\nthree"
+        os.environ["AGENTCHAT_DATA"] = self.data
+        try:
+            from agentchat import store, ui_state
+            import importlib
+            importlib.reload(store)
+            with ui_state.DraftSession() as drafts:
+                drafts.save(f"see {label} done", 0, {label: paste}, 1)
+        finally:
+            os.environ.pop("AGENTCHAT_DATA", None)
+            importlib.reload(store)                 # leave the module as other tests in this process found it
+        screen = self.open()
+        self.assertTrue(screen.until(lambda: f"see {label} done" in screen.term.text()))
+        screen.type("\r")
+        self.assertTrue(screen.until(lambda: any(m["sender"] == "user" for m in screen.messages())))
+        screen.pump(1)
+        sent = [m["text"] for m in screen.messages() if m["sender"] == "user"]
+        self.assertEqual(sent, [f"see {paste} done"])
 
     def test_unsent_draft_survives_a_crash(self):
         screen = self.open()
@@ -856,7 +1082,7 @@ class ChatScreenTests(ScreenCase):
         self.assertTrue(screen.until(lambda: f"↪ #{original['id']} codex: @user should we ship" in screen.term.text()))
         screen.chat("say", "--from", "claude", f"↪ #{original['id']} agreed")
         self.assertTrue(screen.until(lambda: "agreed" in screen.term.text()))
-        self.assertEqual(screen.term.text().count("→ you"), 1)    # only codex's original mentioned the user
+        self.assertEqual(screen.term.text().count("▌"), 1)        # only codex's original mentioned the user
 
     def test_oversized_reply_reference_is_plain_text(self):
         screen = self.open()
@@ -953,7 +1179,7 @@ class ChatScreenTests(ScreenCase):
         screen.chat("say", "--from", "codex", f"↪ #{mine['id']} the dark one")
         self.assertTrue(screen.until(lambda: "the dark one" in screen.term.text()
                                      and f"↪ #{mine['id']} you: which theme" in screen.term.text()
-                                     and "→ you" in screen.term.text()))
+                                     and "▌ the dark one" in screen.term.text()))
 
     def journal_shim(self):
         """Paths of a gate file (blocks the journal write while present) and a fail file (makes it raise)."""
@@ -1022,7 +1248,7 @@ class ChatScreenTests(ScreenCase):
         self.assertTrue(screen.until(lambda: "sending…" in screen.term.text()))
         screen.type("\x03\x03", 0)
         self.assertTrue(screen.until(lambda: "still saving your message" in screen.term.text()))
-        screen.pump(16)                     # over 15 s: the screen keeps waiting rather than quit and lose it
+        screen.pump(16)                     # past the old 15 s silent exit (Codex reproduced that loss)
         self.assertEqual(os.waitpid(screen.pid, os.WNOHANG)[0], 0, "quit before the send was saved")
         self.assertIn("still saving your message", screen.term.text())
         os.remove(gate)                     # the disk recovers: the screen finishes and quits by itself
@@ -1121,19 +1347,23 @@ class ChatScreenTests(ScreenCase):
             found = re.search(pattern, screen.term.text())
             return int(found.group(1)) if found else None
         first_work, first_wait = seconds(r"working · (\d+)s"), seconds(r"agents wait (\d+)s")
+        start = len(screen.raw)
         screen.pump(3.2)                    # no keys pressed
+        ticks = screen.raw[start:]          # each tick is one frame, the cursor hidden while it moves to the clock
+        self.assertTrue(ticks.startswith(b"\x1b[?2026h\x1b[?25l") and ticks.endswith(b"\x1b[?25h\x1b[?2026l"))
         self.assertGreaterEqual(seconds(r"working · (\d+)s"), first_work + 2)
         self.assertLessEqual(seconds(r"agents wait (\d+)s"), first_wait - 2)
 
     def test_paused_and_wait_modes_stay_idle(self):
         screen = self.open()
-        for mode in ("/pause", "/mode wait"):
+        for mode, shown in (("/pause", "paused ·"), ("/mode wait", "your turn")):
             screen.type(mode + "\r")
-            screen.pump(1.5)
+            self.assertTrue(screen.until(lambda: shown in screen.term.text()))
+            screen.pump(0.3)
             ticks = lambda: sum(map(int, Path(f"/proc/{screen.pid}/stat").read_text().split()[13:15]))
             before = ticks()
-            screen.pump(4.0)                # no keys: a refresh loop would burn CPU here
-            self.assertLess(ticks() - before, 40, f"{mode}: busy while idle")
+            screen.pump(2.0)                # no keys: a refresh loop would burn ~200 ticks (2 s of CPU) here
+            self.assertLess(ticks() - before, 20, f"{mode}: busy while idle")
 
     def test_two_press_hints_expire_without_typing(self):
         screen = self.open()

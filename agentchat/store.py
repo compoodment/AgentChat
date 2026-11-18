@@ -562,6 +562,57 @@ def find_request(request_id):
     return None
 
 
+def _without_inline_code(line):
+    # Match whole backtick runs using their lengths, not a backtracking regex.
+    # An unmatched run stays prose; an equal closing run ends the code span.
+    runs = list(re.finditer(r"`+", line))
+    next_run, following = {}, {}
+    for index in range(len(runs)-1, -1, -1):
+        size = runs[index].end() - runs[index].start()
+        if size in following:
+            next_run[index] = following[size]
+        following[size] = index
+    result, cursor, index = [], 0, 0
+    while index < len(runs):
+        if index in next_run:
+            end = next_run[index]
+            result.append(line[cursor:runs[index].start()])
+            result.append(" ")  # removing code must not manufacture a mention
+            cursor, index = runs[end].end(), end+1
+        else:
+            index += 1
+    result.append(line[cursor:])
+    return ''.join(result)
+
+
+def mentioned_agents(text):
+    """Whole agent mentions in prose; quoted/code examples do not address an agent.
+
+    This is deliberately a small routing rule, not a full Markdown renderer.
+    Unclosed fenced blocks remain code; unmatched inline backticks remain prose.
+    """
+    prose = []
+    fence = None
+    for line in text.splitlines():
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is not None:
+            if match and match[1][0] == fence[0] and len(match[1]) >= fence[1] and not match[2].strip():
+                fence = None
+            continue
+        if match:
+            fence = (match[1][0], len(match[1]))
+            continue
+        if line.lstrip().startswith('>') or line.startswith(('    ', '\t')):
+            continue
+        prose.append(_without_inline_code(line))
+    names = re.findall(r"(?<![\w.\\])@(claude|codex|all)(?![\w-])", '\n'.join(prose), re.I)
+    result = {name.lower() for name in names}
+    if 'all' in result:
+        result.remove('all')
+        result.update(AGENTS)
+    return result
+
+
 def append_message(sender, text, kind="msg", *, request_id=None):
     if sender not in SENDERS:
         raise ValueError(f"Unknown sender: {sender}")
@@ -601,8 +652,7 @@ def append_message(sender, text, kind="msg", *, request_id=None):
             source = next((m for m in messages if m["id"] == task_id), None)
             if source is None or source["sender"] != USER or source["kind"] != "msg":
                 raise ValueError(f"Task {task_id} must refer to a user message")
-            assigned = set(re.findall(r"@(claude|codex)\b", source["text"], re.I))
-            assigned = {name.lower() for name in assigned}
+            assigned = mentioned_agents(source["text"])
             if len(assigned) == 1 and sender not in assigned:
                 raise ClaimConflict(f"Task {task_id} is addressed to {next(iter(assigned))}")
         status, noticed = _guard_state(messages)
@@ -706,20 +756,27 @@ def read_tail(limit=1000):
         return candidates
 
 
-def search_messages(query, limit=50, before_id=None):
+def search_messages(query, limit=50, before_id=None, *, kind=None):
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Search query must contain text")
     _integer(limit, "limit")
     if before_id is not None:
         _integer(before_id, "before_id")
+    if kind is not None and (not isinstance(kind, str) or kind not in KINDS):
+        raise ValueError("Invalid search kind")
     if limit == 0:
         return []
     needle = query.casefold()
     with _locked():
-        matches = [message for message in _records()
-                   if (before_id is None or message["id"] < before_id)
-                   and needle in message["text"].casefold()]
-        return [dict(message) for message in matches[-limit:]]
+        matches = []
+        for message in reversed(_records()):
+            if (before_id is not None and message["id"] >= before_id) or (kind is not None and message["kind"] != kind):
+                continue
+            if needle in message["text"].casefold():
+                matches.append(dict(message))
+                if len(matches) == limit:
+                    break
+        return matches[::-1]
 
 
 def set_presence(agent, state, note="", *, ttl=900):

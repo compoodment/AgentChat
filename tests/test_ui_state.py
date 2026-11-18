@@ -144,8 +144,30 @@ class UIStateTests(unittest.TestCase):
             with ui_state.DraftSession() as recovered:
                 self.assertEqual(recovered.restored['draft'],'already committed')
                 self.assertTrue(recovered.warnings)
+                with mock.patch.object(store, '_atomic_json', side_effect=OSError('disk unavailable')):
+                    with self.assertRaises(OSError):
+                        recovered.save('edit that did not save', 3)
                 recovered.send('already committed','already committed',5)
         self.assertEqual(len(store.read_messages()),1)
+
+    def test_draft_representation_change_keeps_pending_token_across_cursor_save(self):
+        label, marker = '[old label]', chr(0xf0002)
+        text = 'before\npasted text'
+        old_draft = 'before' + label
+        new_draft = 'before' + marker
+        with ui_state.DraftSession() as draft:
+            with mock.patch.object(draft, 'save', side_effect=OSError('cleanup unavailable')):
+                first = draft.send(text, old_draft, len(old_draft), {label: '\npasted text'}, 1)
+        with mock.patch.object(store, 'find_request', side_effect=OSError('temporary read error')):
+            with ui_state.DraftSession() as recovered:
+                recovered.adopt_restored_representation(new_draft, len(new_draft),
+                                                        {marker: '\npasted text'}, 2)
+                recovered.save(new_draft, len(new_draft) - 1, {marker: '\npasted text'}, 2)
+                saved = json.loads(recovered.path.read_text())
+                self.assertEqual(saved['pending_send']['request_id'], first['request_id'])
+                second = recovered.send(text, new_draft, len(new_draft) - 1, {marker: '\npasted text'}, 2)
+                self.assertEqual(second, first)
+        self.assertEqual(store.read_messages(), [first])
 
 
 if __name__=='__main__':unittest.main()
